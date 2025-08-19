@@ -668,13 +668,27 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
                 if let Some(map_entries) = resolve_map_value(value) {
                     bit_util::set_bit(&mut null_buffer, row_idx);
 
-                    let entries = if sorted_keys {
-                        let mut entries: Vec<(String, Value)> = Vec::with_capacity(map_entries.len());
-                        entries.extend(map_entries.into_iter());
-                        entries.sort_by(|a, b| a.0.cmp(&b.0));
-                        entries
+                    // Validate all keys for this map at once (batched validation)
+                    for key in map_entries.keys() {
+                        if key.is_empty() {
+                            return Err(ArrowError::InvalidArgumentError(
+                                format!("Empty key found in map at row {}", row_idx)
+                            ));
+                        }
+                    }
+
+                    let entries: Vec<(String, Value)> = if sorted_keys {
+                        // Use BTreeMap to automatically maintain sorted order
+                        let sorted_map: BTreeMap<String, Value> = map_entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        sorted_map.into_iter().collect()
                     } else {
-                        map_entries.into_iter().collect()
+                        // Only clone when we need to collect into Vec
+                        map_entries.iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
                     };
 
                     cur_offset += entries.len() as i32;
@@ -726,7 +740,6 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
             let mut values: Vec<Option<T::Native>> = Vec::with_capacity(total_entries);
             for entries in all_entries {
                 for (key, val) in entries {
-                    Self::validate_map_key(key)?;
                     keys_builder.append_value(key);
                     values.push(resolve_item::<T>(val));
                 }
@@ -736,7 +749,6 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
             let mut values: Vec<T::Native> = Vec::with_capacity(total_entries);
             for entries in all_entries {
                 for (key, val) in entries {
-                    Self::validate_map_key(key)?;
                     keys_builder.append_value(key);
                     if let Some(v) = resolve_item::<T>(val) {
                         values.push(v);
@@ -783,12 +795,31 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
         match value_type {
             DataType::Utf8 => {
                 if value_nullable {
-                    let mut values_builder = StringBuilder::with_capacity(total_entries, 0);
+                    // Calculate estimated string capacity based on sample
+                    let estimated_str_capacity = if total_entries > 0 {
+                        // Sample first few entries to estimate average string length
+                        let sample_size = std::cmp::min(10, total_entries);
+                        let mut sample_length = 0;
+                        let mut sample_count = 0;
+                        'outer: for entries in all_entries.iter().take(5) {
+                            for (_, val) in entries.iter().take(sample_size) {
+                                if let Ok(Some(s)) = resolve_string(val) {
+                                    sample_length += s.len();
+                                    sample_count += 1;
+                                    if sample_count >= sample_size { break 'outer; }
+                                }
+                            }
+                        }
+                        if sample_count > 0 { (sample_length / sample_count) * total_entries } else { total_entries * 10 }
+                    } else { 0 };
+                    let mut values_builder = StringBuilder::with_capacity(total_entries, estimated_str_capacity);
                     for entries in all_entries {
                         for (key, val) in entries {
-                            Self::validate_map_key(key)?;
                             keys_builder.append_value(key);
-                            if let Ok(Some(s)) = resolve_string(val) {
+                            // Try zero-copy string reference first
+                            if let Ok(Some(s_ref)) = resolve_string_ref(val) {
+                                values_builder.append_value(s_ref);
+                            } else if let Ok(Some(s)) = resolve_string(val) {
                                 values_builder.append_value(&s);
                             } else {
                                 values_builder.append_null();
@@ -801,9 +832,11 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
                     let mut values: Vec<String> = Vec::with_capacity(total_entries);
                     for entries in all_entries {
                         for (key, val) in entries {
-                            Self::validate_map_key(key)?;
                             keys_builder.append_value(key);
-                            if let Ok(Some(s)) = resolve_string(val) {
+                            // Try zero-copy string reference first
+                            if let Ok(Some(s_ref)) = resolve_string_ref(val) {
+                                values.push(s_ref.to_string());
+                            } else if let Ok(Some(s)) = resolve_string(val) {
                                 values.push(s);
                             } else {
                                 return Err(ArrowError::InvalidArgumentError(format!(
@@ -833,7 +866,6 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
                     let mut values_builder = BooleanBuilder::with_capacity(total_entries);
                     for entries in all_entries {
                         for (key, val) in entries {
-                            Self::validate_map_key(key)?;
                             keys_builder.append_value(key);
                             if let Some(b) = resolve_boolean(val) {
                                 values_builder.append_value(b);
@@ -848,7 +880,6 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
                     let mut values: Vec<bool> = Vec::with_capacity(total_entries);
                     for entries in all_entries {
                         for (key, val) in entries {
-                            Self::validate_map_key(key)?;
                             keys_builder.append_value(key);
                             if let Some(b) = resolve_boolean(val) {
                                 values.push(b);
@@ -872,22 +903,6 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
         }
     }
 
-    /// Validate that a map key is valid according to Avro requirements.
-    /// 
-    /// # Arguments
-    /// * `key` - The map key to validate
-    /// 
-    /// # Returns
-    /// * `Ok(())` if the key is valid
-    /// * `Err(ArrowError)` if the key is invalid
-    fn validate_map_key(key: &str) -> ArrowResult<()> {
-        if key.is_empty() {
-            return Err(ArrowError::InvalidArgumentError(
-                "Map keys cannot be empty".to_string()
-            ));
-        }
-        Ok(())
-    }
 
     /// Assemble the final MapArray from keys, values, and metadata.
     /// 
@@ -1344,6 +1359,22 @@ fn resolve_string(v: &Value) -> ArrowResult<Option<String>> {
     .map_err(|e| SchemaError(format!("expected resolvable string : {e:?}")))
 }
 
+/// Zero-copy string reference resolver for better performance
+fn resolve_string_ref(v: &Value) -> ArrowResult<Option<&str>> {
+    let v = if let Value::Union(_, b) = v { b } else { v };
+    match v {
+        Value::String(s) => Ok(Some(s.as_str())),
+        Value::Enum(_, s) => Ok(Some(s.as_str())),
+        Value::Null => Ok(None),
+        Value::Bytes(_) => {
+            // For bytes we still need to convert, but this is rare for string fields
+            Ok(None) // Fallback to original resolve_string for bytes
+        },
+        other => Err(AvroError::GetString(other.into())),
+    }
+    .map_err(|e| SchemaError(format!("expected resolvable string : {e:?}")))
+}
+
 fn resolve_u8(v: &Value) -> Option<u8> {
     let v = match v {
         Value::Union(_, inner) => inner.as_ref(),
@@ -1371,21 +1402,22 @@ fn resolve_bytes(v: &Value) -> Option<Vec<u8>> {
     }
 }
 
-/// Resolves an Avro Map value into a HashMap.
+/// Resolves an Avro Map value into a HashMap reference.
 /// 
 /// Maps in Avro are represented as HashMap<String, Value> where keys are always strings.
 /// This function handles union-wrapped maps as well by unwrapping them first.
+/// Returns a reference to avoid expensive cloning.
 /// 
 /// # Arguments
 /// * `v` - The Avro value that may contain a map
 /// 
 /// # Returns
-/// * `Some(HashMap<String, Value>)` if the value contains a map
+/// * `Some(&HashMap<String, Value>)` if the value contains a map
 /// * `None` if the value is not a map
-fn resolve_map_value(v: &Value) -> Option<HashMap<String, Value>> {
+fn resolve_map_value(v: &Value) -> Option<&HashMap<String, Value>> {
     let v = maybe_resolve_union(v);
     match v {
-        Value::Map(map) => Some(map.clone()),
+        Value::Map(map) => Some(map),
         _ => None,
     }
 }
