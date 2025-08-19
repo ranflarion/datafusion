@@ -21,7 +21,7 @@ use apache_avro::schema::{
 use apache_avro::types::Value;
 use apache_avro::Schema as AvroSchema;
 use arrow::datatypes::{DataType, IntervalUnit, Schema, TimeUnit, UnionMode};
-use arrow::datatypes::{Field, UnionFields};
+use arrow::datatypes::{Field, Fields, UnionFields};
 use datafusion_common::error::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -82,10 +82,13 @@ fn schema_to_field_with_props(
                 false,
                 None,
             )?;
-            DataType::Dictionary(
-                Box::new(DataType::Utf8),
-                Box::new(value_field.data_type().clone()),
-            )
+            let key_field = Field::new("key", DataType::Utf8, false);
+            let entry_field = Field::new_struct(
+                "entries", 
+                Fields::from(vec![key_field, value_field]),
+                false
+            );
+            DataType::Map(Arc::new(entry_field), false)
         }
         AvroSchema::Union(us) => {
             // If there are only two variants and one of them is null, set the other type as the field data type
@@ -224,8 +227,8 @@ fn default_field_name(dt: &DataType) -> &str {
         DataType::LargeList(_) => "largelist",
         DataType::Struct(_) => "struct",
         DataType::Union(_, _) => "union",
-        DataType::Dictionary(_, _) => "map",
-        DataType::Map(_, _) => unimplemented!("Map support not implemented"),
+        DataType::Dictionary(_, _) => "dictionary",
+        DataType::Map(_, _) => "map",
         DataType::RunEndEncoded(_, _) => {
             unimplemented!("RunEndEncoded support not implemented")
         }

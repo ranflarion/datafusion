@@ -25,10 +25,13 @@ use apache_avro::{
 };
 use arrow::array::{
     make_array, Array, ArrayBuilder, ArrayData, ArrayDataBuilder, ArrayRef,
-    BooleanBuilder, LargeStringArray, ListBuilder, NullArray, OffsetSizeTrait,
+    BooleanArray, BooleanBuilder, 
+    LargeStringArray, ListBuilder, NullArray, OffsetSizeTrait,
     PrimitiveArray, StringArray, StringBuilder, StringDictionaryBuilder,
 };
-use arrow::array::{BinaryArray, FixedSizeBinaryArray, GenericListArray};
+use arrow::array::{
+    BinaryArray, FixedSizeBinaryArray, GenericListArray, MapArray, StructArray,
+};
 use arrow::buffer::{Buffer, MutableBuffer};
 use arrow::datatypes::{
     ArrowDictionaryKeyType, ArrowNumericType, ArrowPrimitiveType, DataType, Date32Type,
@@ -47,7 +50,7 @@ use arrow::util::bit_util;
 use datafusion_common::arrow_err;
 use datafusion_common::error::{DataFusionError, Result};
 use num_traits::NumCast;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::Arc;
 
@@ -138,6 +141,14 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
                     schema_lookup,
                 )?;
             }
+            AvroSchema::Map(map_schema) => {
+                let sub_parent_field_name = format!("{parent_field_name}.value");
+                Self::child_schema_lookup(
+                    &sub_parent_field_name,
+                    &map_schema.types,
+                    schema_lookup,
+                )?;
+            }
             _ => (),
         }
         Ok(schema_lookup)
@@ -173,6 +184,7 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
 
         Some(arrays.and_then(|arr| RecordBatch::try_new(Arc::clone(&self.schema), arr)))
     }
+
 
     fn build_boolean_array(&self, rows: RecordSlice, col_name: &str) -> ArrayRef {
         let mut builder = BooleanBuilder::with_capacity(rows.len());
@@ -624,6 +636,374 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
         Ok(Arc::new(GenericListArray::<OffsetSize>::from(list_data)))
     }
 
+    /// Collect map entries from Avro rows and prepare offsets for MapArray construction.
+    /// 
+    /// This function extracts map data from Avro records, handling null values and 
+    /// optional key sorting. It returns the collected entries along with the offset
+    /// and null buffer information needed for Arrow MapArray construction.
+    /// 
+    /// # Arguments
+    /// * `rows` - Slice of Avro record data
+    /// * `col_name` - Name of the column containing map data
+    /// * `sorted_keys` - Whether to sort map keys alphabetically
+    /// 
+    /// # Returns
+    /// * `Ok((entries, offsets, null_buffer, total_entries))` on success
+    /// * `Err(ArrowError)` if there are issues processing the data
+    fn collect_map_entries(
+        &self,
+        rows: RecordSlice,
+        col_name: &str,
+        sorted_keys: bool,
+    ) -> ArrowResult<(Vec<Vec<(String, Value)>>, Vec<i32>, MutableBuffer, usize)> {
+        let mut all_entries = Vec::new();
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        let mut cur_offset = 0i32;
+        offsets.push(cur_offset);
+        let num_bytes = bit_util::ceil(rows.len(), 8);
+        let mut null_buffer = MutableBuffer::from_len_zeroed(num_bytes);
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            if let Some(value) = self.field_lookup(col_name, row) {
+                if let Some(map_entries) = resolve_map_value(value) {
+                    bit_util::set_bit(&mut null_buffer, row_idx);
+
+                    let entries = if sorted_keys {
+                        let mut entries: Vec<(String, Value)> = Vec::with_capacity(map_entries.len());
+                        entries.extend(map_entries.into_iter());
+                        entries.sort_by(|a, b| a.0.cmp(&b.0));
+                        entries
+                    } else {
+                        map_entries.into_iter().collect()
+                    };
+
+                    cur_offset += entries.len() as i32;
+                    all_entries.push(entries);
+                } else {
+                    all_entries.push(Vec::new());
+                }
+            } else {
+                all_entries.push(Vec::new());
+            }
+            offsets.push(cur_offset);
+        }
+
+        let total_entries = cur_offset as usize;
+        Ok((all_entries, offsets, null_buffer, total_entries))
+    }
+
+    /// Generic helper for building primitive type arrays for map values.
+    /// 
+    /// This function creates Arrow primitive arrays from Avro map values, handling both
+    /// nullable and non-nullable cases. It uses the provided type parameter to determine
+    /// the target Arrow primitive type and properly resolves Avro values to native types.
+    /// 
+    /// # Type Parameters
+    /// * `T` - Arrow primitive type (e.g., Int32Type, Float64Type)
+    /// 
+    /// # Arguments  
+    /// * `all_entries` - All map entries collected from rows
+    /// * `keys_builder` - Builder for the keys array (modified in place)
+    /// * `value_nullable` - Whether the values should be nullable
+    /// * `col_name` - Column name for error messages
+    /// 
+    /// # Returns
+    /// * `Ok(ArrayRef)` containing the primitive array
+    /// * `Err(ArrowError)` if conversion fails or null values found in non-nullable field
+    fn build_primitive_map_values<T>(
+        all_entries: &[Vec<(String, Value)>],
+        keys_builder: &mut StringBuilder,
+        value_nullable: bool,
+        col_name: &str,
+        total_entries: usize,
+    ) -> ArrowResult<ArrayRef>
+    where
+        T: ArrowPrimitiveType + ArrowNumericType,
+        T::Native: NumCast,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+    {
+        if value_nullable {
+            let mut values: Vec<Option<T::Native>> = Vec::with_capacity(total_entries);
+            for entries in all_entries {
+                for (key, val) in entries {
+                    Self::validate_map_key(key)?;
+                    keys_builder.append_value(key);
+                    values.push(resolve_item::<T>(val));
+                }
+            }
+            Ok(Arc::new(values.into_iter().collect::<PrimitiveArray<T>>()))
+        } else {
+            let mut values: Vec<T::Native> = Vec::with_capacity(total_entries);
+            for entries in all_entries {
+                for (key, val) in entries {
+                    Self::validate_map_key(key)?;
+                    keys_builder.append_value(key);
+                    if let Some(v) = resolve_item::<T>(val) {
+                        values.push(v);
+                    } else {
+                        return Err(ArrowError::InvalidArgumentError(format!(
+                            "Null value found for key '{}' in non-nullable {} map field '{}'",
+                            key,
+                            std::any::type_name::<T::Native>(),
+                            col_name
+                        )));
+                    }
+                }
+            }
+            Ok(Arc::new(PrimitiveArray::<T>::from(values)))
+        }
+    }
+
+    /// Build the values array for map entries based on the value type and nullability.
+    /// 
+    /// This function dispatches to the appropriate array building logic based on the 
+    /// Arrow data type. It handles strings, primitive numeric types, booleans, and 
+    /// ensures proper nullability handling as specified by the field schema.
+    /// 
+    /// # Arguments
+    /// * `all_entries` - All map entries collected from rows  
+    /// * `keys_builder` - Builder for the keys array (modified in place)
+    /// * `value_field` - Arrow field defining the value type and nullability
+    /// * `col_name` - Column name for error messages
+    /// 
+    /// # Returns
+    /// * `Ok(ArrayRef)` containing the values array
+    /// * `Err(ArrowError)` if the value type is unsupported or conversion fails
+    fn build_map_values_array(
+        &self,
+        all_entries: &[Vec<(String, Value)>],
+        keys_builder: &mut StringBuilder,
+        value_field: &Field,
+        col_name: &str,
+        total_entries: usize,
+    ) -> ArrowResult<ArrayRef> {
+        let value_type = value_field.data_type();
+        let value_nullable = value_field.is_nullable();
+
+        match value_type {
+            DataType::Utf8 => {
+                if value_nullable {
+                    let mut values_builder = StringBuilder::with_capacity(total_entries, 0);
+                    for entries in all_entries {
+                        for (key, val) in entries {
+                            Self::validate_map_key(key)?;
+                            keys_builder.append_value(key);
+                            if let Ok(Some(s)) = resolve_string(val) {
+                                values_builder.append_value(&s);
+                            } else {
+                                values_builder.append_null();
+                            }
+                        }
+                    }
+                    Ok(Arc::new(values_builder.finish()))
+                } else {
+                    // Non-nullable string array
+                    let mut values: Vec<String> = Vec::with_capacity(total_entries);
+                    for entries in all_entries {
+                        for (key, val) in entries {
+                            Self::validate_map_key(key)?;
+                            keys_builder.append_value(key);
+                            if let Ok(Some(s)) = resolve_string(val) {
+                                values.push(s);
+                            } else {
+                                return Err(ArrowError::InvalidArgumentError(format!(
+                                    "Null value found for key '{}' in non-nullable string map field '{}'",
+                                    key, col_name
+                                )));
+                            }
+                        }
+                    }
+                    Ok(Arc::new(StringArray::from(values)))
+                }
+            }
+            DataType::Int32 => {
+                Self::build_primitive_map_values::<Int32Type>(all_entries, keys_builder, value_nullable, col_name, total_entries)
+            }
+            DataType::Int64 => {
+                Self::build_primitive_map_values::<Int64Type>(all_entries, keys_builder, value_nullable, col_name, total_entries)
+            }
+            DataType::Float32 => {
+                Self::build_primitive_map_values::<Float32Type>(all_entries, keys_builder, value_nullable, col_name, total_entries)
+            }
+            DataType::Float64 => {
+                Self::build_primitive_map_values::<Float64Type>(all_entries, keys_builder, value_nullable, col_name, total_entries)
+            }
+            DataType::Boolean => {
+                if value_nullable {
+                    let mut values_builder = BooleanBuilder::with_capacity(total_entries);
+                    for entries in all_entries {
+                        for (key, val) in entries {
+                            Self::validate_map_key(key)?;
+                            keys_builder.append_value(key);
+                            if let Some(b) = resolve_boolean(val) {
+                                values_builder.append_value(b);
+                            } else {
+                                values_builder.append_null();
+                            }
+                        }
+                    }
+                    Ok(Arc::new(values_builder.finish()))
+                } else {
+                    // Non-nullable boolean array
+                    let mut values: Vec<bool> = Vec::with_capacity(total_entries);
+                    for entries in all_entries {
+                        for (key, val) in entries {
+                            Self::validate_map_key(key)?;
+                            keys_builder.append_value(key);
+                            if let Some(b) = resolve_boolean(val) {
+                                values.push(b);
+                            } else {
+                                return Err(ArrowError::InvalidArgumentError(format!(
+                                    "Null value found for key '{}' in non-nullable boolean map field '{}'",
+                                    key, col_name
+                                )));
+                            }
+                        }
+                    }
+                    Ok(Arc::new(BooleanArray::from(values)))
+                }
+            }
+            _ => {
+                return Err(SchemaError(format!(
+                    "Map value type {:?} not yet supported",
+                    value_type
+                )));
+            }
+        }
+    }
+
+    /// Validate that a map key is valid according to Avro requirements.
+    /// 
+    /// # Arguments
+    /// * `key` - The map key to validate
+    /// 
+    /// # Returns
+    /// * `Ok(())` if the key is valid
+    /// * `Err(ArrowError)` if the key is invalid
+    fn validate_map_key(key: &str) -> ArrowResult<()> {
+        if key.is_empty() {
+            return Err(ArrowError::InvalidArgumentError(
+                "Map keys cannot be empty".to_string()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Assemble the final MapArray from keys, values, and metadata.
+    /// 
+    /// This function creates the final Arrow MapArray by combining the keys array,
+    /// values array, and structural metadata. It constructs the proper struct array
+    /// for the map entries and builds the final MapArray with correct schema information.
+    /// 
+    /// # Arguments
+    /// * `keys_array` - Array containing all map keys
+    /// * `values_array` - Array containing all map values  
+    /// * `value_field` - Field defining the value type and nullability
+    /// * `offsets` - Offset buffer indicating map boundaries
+    /// * `null_buffer` - Buffer indicating which maps are null
+    /// * `sorted_keys` - Whether keys are sorted
+    /// * `rows_len` - Number of rows in the result
+    /// 
+    /// # Returns
+    /// * `Ok(ArrayRef)` containing the final MapArray
+    /// * `Err(ArrowError)` if array construction fails
+    fn assemble_map_array(
+        keys_array: ArrayRef,
+        values_array: ArrayRef,
+        value_field: &Field,
+        offsets: Vec<i32>,
+        null_buffer: MutableBuffer,
+        sorted_keys: bool,
+        rows_len: usize,
+    ) -> ArrowResult<ArrayRef> {
+        let value_type = value_field.data_type();
+        let value_nullable = value_field.is_nullable();
+
+        // Build the struct array for key-value pairs - now with proper types
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                keys_array,
+            ),
+            (
+                Arc::new(Field::new("value", value_type.clone(), value_nullable)),
+                values_array,
+            ),
+        ]);
+
+        // Build the map array
+        let map_field = Field::new_struct(
+            "entries",
+            Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", value_type.clone(), value_nullable),
+            ]),
+            false,
+        );
+
+        let map_data =
+            ArrayData::builder(DataType::Map(Arc::new(map_field), sorted_keys))
+                .len(rows_len)
+                .add_buffer(Buffer::from_slice_ref(&offsets))
+                .add_child_data(struct_array.to_data())
+                .null_bit_buffer(Some(null_buffer.into()))
+                .build()?;
+
+        Ok(Arc::new(MapArray::from(map_data)))
+    }
+
+    /// Build a MapArray from Avro map values.
+    /// 
+    /// This is the main entry point for converting Avro map data to Arrow MapArray.
+    /// It orchestrates the entire conversion process by:
+    /// 1. Collecting map entries and metadata from Avro records
+    /// 2. Building separate keys and values arrays with proper types
+    /// 3. Assembling the final MapArray with correct Arrow schema
+    /// 
+    /// The function properly handles nullable/non-nullable value types, key sorting,
+    /// and ensures schema compatibility between the generated array and expected types.
+    /// 
+    /// # Arguments
+    /// * `rows` - Slice of Avro record data
+    /// * `col_name` - Name of the column containing map data
+    /// * `value_field` - Arrow field defining the map's value type and nullability
+    /// * `sorted_keys` - Whether to sort map keys alphabetically
+    /// 
+    /// # Returns
+    /// * `Ok(ArrayRef)` containing the MapArray
+    /// * `Err(ArrowError)` if conversion fails due to type mismatches or data issues
+    fn build_map_array(
+        &self,
+        rows: RecordSlice,
+        col_name: &str,
+        value_field: &Field,
+        sorted_keys: bool,
+    ) -> ArrowResult<ArrayRef> {
+        let (all_entries, offsets, null_buffer, total_entries) = self.collect_map_entries(rows, col_name, sorted_keys)?;
+        
+        let mut keys_builder = StringBuilder::with_capacity(total_entries, 0);
+        let values_array = self.build_map_values_array(
+            &all_entries, 
+            &mut keys_builder, 
+            value_field,
+            col_name,
+            total_entries
+        )?;
+        
+        let keys_array: ArrayRef = Arc::new(keys_builder.finish());
+        
+        Self::assemble_map_array(
+            keys_array,
+            values_array,
+            value_field,
+            offsets,
+            null_buffer,
+            sorted_keys,
+            rows.len(),
+        )
+    }
+
+
     /// Builds the child values of a `StructArray`, falling short of constructing the StructArray.
     /// The function does not construct the StructArray as some callers would want the child arrays.
     ///
@@ -785,6 +1165,32 @@ impl<R: Read> AvroArrowArrayReader<'_, R> {
                                     list_field,
                                 )?
                             }
+                        }
+                    }
+                    // Add this case before the default error case in build_struct_array:
+                    DataType::Map(map_field, sorted_keys) => {
+                        // Maps in Arrow have a specific structure with entries field
+                        if let DataType::Struct(fields) = map_field.data_type() {
+                            if fields.len() == 2 {
+                                // Extract the value field from the struct
+                                let value_field = &fields[1];
+                                self.build_map_array(
+                                    rows,
+                                    &field_path,
+                                    value_field,
+                                    *sorted_keys,
+                                )?
+                            } else {
+                                return Err(SchemaError(format!(
+                "Invalid map structure: expected 2 fields (key, value), got {}",
+                fields.len()
+            )));
+                            }
+                        } else {
+                            return Err(SchemaError(format!(
+                                "Invalid map field type: expected Struct, got {:?}",
+                                map_field.data_type()
+                            )));
                         }
                     }
                     DataType::Dictionary(ref key_ty, ref val_ty) => self
@@ -965,6 +1371,25 @@ fn resolve_bytes(v: &Value) -> Option<Vec<u8>> {
     }
 }
 
+/// Resolves an Avro Map value into a HashMap.
+/// 
+/// Maps in Avro are represented as HashMap<String, Value> where keys are always strings.
+/// This function handles union-wrapped maps as well by unwrapping them first.
+/// 
+/// # Arguments
+/// * `v` - The Avro value that may contain a map
+/// 
+/// # Returns
+/// * `Some(HashMap<String, Value>)` if the value contains a map
+/// * `None` if the value is not a map
+fn resolve_map_value(v: &Value) -> Option<HashMap<String, Value>> {
+    let v = maybe_resolve_union(v);
+    match v {
+        Value::Map(map) => Some(map.clone()),
+        _ => None,
+    }
+}
+
 fn resolve_fixed(v: &Value, size: usize) -> Option<Vec<u8>> {
     let v = if let Value::Union(_, b) = v { b } else { v };
     match v {
@@ -1036,7 +1461,7 @@ where
 #[cfg(test)]
 mod test {
     use crate::avro_to_arrow::{Reader, ReaderBuilder};
-    use arrow::array::Array;
+    use arrow::array::{Array, MapArray, StructArray};
     use arrow::datatypes::DataType;
     use arrow::datatypes::{Field, TimeUnit};
     use datafusion_common::assert_batches_eq;
@@ -1718,5 +2143,344 @@ mod test {
         assert_eq!(8, sum_num_rows);
         assert_eq!(2, num_batches);
         assert_eq!(28, sum_id);
+    }
+
+    #[test]
+    fn test_avro_map_string_values() {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+        {
+          "type": "record",
+          "name": "TestRecord",
+          "fields": [
+            {
+              "name": "metadata",
+              "type": ["null", {"type": "map", "values": "string"}],
+              "default": null
+            }
+          ]
+        }"#,
+        )
+        .unwrap();
+
+        let mut records = vec![];
+
+        // Record with map containing multiple entries
+        let r1 = apache_avro::to_value(serde_json::json!({
+            "metadata": {
+                "key1": "value1",
+                "key2": "value2",
+                "key3": "value3"
+            }
+        }))
+        .unwrap()
+        .resolve(&schema)
+        .unwrap();
+        records.push(r1);
+
+        // Record with empty map
+        let r2 = apache_avro::to_value(serde_json::json!({
+            "metadata": {}
+        }))
+        .unwrap()
+        .resolve(&schema)
+        .unwrap();
+        records.push(r2);
+
+        // Record with null map
+        let r3 = apache_avro::to_value(serde_json::json!({
+            "metadata": null
+        }))
+        .unwrap()
+        .resolve(&schema)
+        .unwrap();
+        records.push(r3);
+
+        let mut w = apache_avro::Writer::new(&schema, vec![]);
+        for record in records {
+            w.append(record).unwrap();
+        }
+        let bytes = w.into_inner().unwrap();
+
+        let mut reader = ReaderBuilder::new()
+            .read_schema()
+            .with_batch_size(3)
+            .build(std::io::Cursor::new(bytes))
+            .unwrap();
+
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 1);
+
+        let map_array = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+
+        // First row should have 3 entries
+        assert!(!map_array.is_null(0));
+        let first_map = map_array.value(0);
+        assert_eq!(first_map.len(), 3);
+
+        // Second row should be empty but not null
+        assert!(!map_array.is_null(1));
+        let second_map = map_array.value(1);
+        assert_eq!(second_map.len(), 0);
+
+        // Third row should be null
+        assert!(map_array.is_null(2));
+    }
+
+    #[test]
+    fn test_avro_map_numeric_values() {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+        {
+          "type": "record",
+          "name": "MetricsRecord",
+          "fields": [
+            {
+              "name": "counters",
+              "type": {"type": "map", "values": "long"}
+            },
+            {
+              "name": "rates",
+              "type": ["null", {"type": "map", "values": "double"}],
+              "default": null
+            }
+          ]
+        }"#,
+        )
+        .unwrap();
+
+        let r1 = apache_avro::to_value(serde_json::json!({
+            "counters": {
+                "requests": 1000,
+                "errors": 42,
+                "successes": 958
+            },
+            "rates": {
+                "success_rate": 0.958,
+                "error_rate": 0.042
+            }
+        }))
+        .unwrap()
+        .resolve(&schema)
+        .unwrap();
+
+        let mut w = apache_avro::Writer::new(&schema, vec![]);
+        w.append(r1).unwrap();
+        let bytes = w.into_inner().unwrap();
+
+        let mut reader = ReaderBuilder::new()
+            .read_schema()
+            .with_batch_size(1)
+            .build(std::io::Cursor::new(bytes))
+            .unwrap();
+
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 2);
+
+        // Verify counters map
+        let counters = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(counters.value(0).len(), 3);
+
+        // Verify rates map
+        let rates = batch.column(1).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(rates.value(0).len(), 2);
+    }
+
+    #[test]
+    fn test_avro_nested_maps() {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+        {
+          "type": "record",
+          "name": "ConfigRecord",
+          "fields": [
+            {
+              "name": "settings",
+              "type": {
+                "type": "record",
+                "name": "Settings",
+                "fields": [
+                  {
+                    "name": "features",
+                    "type": {"type": "map", "values": "boolean"}
+                  },
+                  {
+                    "name": "limits",
+                    "type": {"type": "map", "values": "int"}
+                  }
+                ]
+              }
+            }
+          ]
+        }"#,
+        )
+        .unwrap();
+
+        let r1 = apache_avro::to_value(serde_json::json!({
+            "settings": {
+                "features": {
+                    "feature_a": true,
+                    "feature_b": false,
+                    "feature_c": true
+                },
+                "limits": {
+                    "max_connections": 100,
+                    "timeout_seconds": 30,
+                    "retry_count": 3
+                }
+            }
+        }))
+        .unwrap()
+        .resolve(&schema)
+        .unwrap();
+
+        let mut w = apache_avro::Writer::new(&schema, vec![]);
+        w.append(r1).unwrap();
+        let bytes = w.into_inner().unwrap();
+
+        let mut reader = ReaderBuilder::new()
+            .read_schema()
+            .with_batch_size(1)
+            .build(std::io::Cursor::new(bytes))
+            .unwrap();
+
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // Verify nested structure
+        let settings_col = batch.column(0);
+        let settings_struct =
+            settings_col.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let features_map = settings_struct
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_eq!(features_map.value(0).len(), 3);
+
+        let limits_map = settings_struct
+            .column(1)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_eq!(limits_map.value(0).len(), 3);
+    }
+
+    #[test]
+    fn test_avro_map_with_nullable_values() {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+        {
+          "type": "record",
+          "name": "NullableMapRecord",
+          "fields": [
+            {
+              "name": "optional_data",
+              "type": {"type": "map", "values": ["null", "string"]}
+            }
+          ]
+        }"#,
+        )
+        .unwrap();
+
+        let r1 = apache_avro::to_value(serde_json::json!({
+            "optional_data": {
+                "present": "value",
+                "absent": null,
+                "another": "data"
+            }
+        }))
+        .unwrap()
+        .resolve(&schema)
+        .unwrap();
+
+        let mut w = apache_avro::Writer::new(&schema, vec![]);
+        w.append(r1).unwrap();
+        let bytes = w.into_inner().unwrap();
+
+        let mut reader = ReaderBuilder::new()
+            .read_schema()
+            .with_batch_size(1)
+            .build(std::io::Cursor::new(bytes))
+            .unwrap();
+
+        let batch = reader.next().unwrap().unwrap();
+        let map_col = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        let map_value = map_col.value(0);
+
+        // Should have 3 entries even with null value
+        assert_eq!(map_value.len(), 3);
+
+        // Verify the struct array contains correct nulls
+        let struct_array = map_value.as_any().downcast_ref::<StructArray>().unwrap();
+        let values = struct_array.column(1); // value column
+
+        // Check that null values are handled correctly
+        // Note: order might vary due to HashMap, so we check total null count
+        let null_count = (0..values.len()).filter(|i| values.is_null(*i)).count();
+        assert_eq!(null_count, 1); // Should have exactly one null value
+    }
+
+    #[test]
+    fn test_avro_large_map_performance() {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+        {
+          "type": "record",
+          "name": "LargeMapRecord",
+          "fields": [
+            {
+              "name": "large_map",
+              "type": {"type": "map", "values": "string"}
+            }
+          ]
+        }"#,
+        )
+        .unwrap();
+
+        // Create a large map with 10000 entries using JSON
+        let mut large_map = serde_json::Map::new();
+        for i in 0..10000 {
+            large_map.insert(
+                format!("key_{:05}", i),
+                serde_json::Value::String(format!("value_{:05}", i)),
+            );
+        }
+
+        let r1 = apache_avro::to_value(serde_json::json!({
+            "large_map": large_map
+        }))
+        .unwrap()
+        .resolve(&schema)
+        .unwrap();
+
+        let mut w = apache_avro::Writer::new(&schema, vec![]);
+        w.append(r1).unwrap();
+        let bytes = w.into_inner().unwrap();
+
+        let start = std::time::Instant::now();
+        let mut reader = ReaderBuilder::new()
+            .read_schema()
+            .with_batch_size(1)
+            .build(std::io::Cursor::new(bytes))
+            .unwrap();
+
+        let batch = reader.next().unwrap().unwrap();
+        let duration = start.elapsed();
+
+        // Verify correctness
+        assert_eq!(batch.num_rows(), 1);
+        let map_array = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map_array.value(0).len(), 10000);
+
+        // Performance assertion - should complete in reasonable time
+        assert!(
+            duration.as_millis() < 500,
+            "Large map processing took too long: {:?}",
+            duration
+        );
     }
 }
